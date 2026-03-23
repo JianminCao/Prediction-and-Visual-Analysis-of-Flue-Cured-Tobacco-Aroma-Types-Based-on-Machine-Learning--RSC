@@ -1,0 +1,534 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import warnings
+import shap
+import random
+import sys
+import xgboost as xgb  # 保留但不使用，避免导入报错
+from deap import base, creator, tools, algorithms
+from sklearn.model_selection import (StratifiedKFold, train_test_split,
+                                     cross_val_score)
+from sklearn.preprocessing import StandardScaler, LabelBinarizer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
+                             f1_score, confusion_matrix, classification_report,
+                             roc_auc_score, roc_curve, auc)
+from sklearn.ensemble import RandomForestClassifier
+
+# 忽略警告
+warnings.filterwarnings('ignore')
+
+# 设置图表样式：新罗马字体、加粗、英文（适配Python3.9）
+plt.rcParams["font.family"] = ["Times New Roman", "DejaVu Serif"]
+plt.rcParams["font.weight"] = "bold"
+plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["axes.labelweight"] = "bold"
+plt.rcParams["axes.titleweight"] = "bold"
+plt.rcParams["xtick.major.size"] = 4
+plt.rcParams["ytick.major.size"] = 4
+sns.set(font='Times New Roman', font_scale=1.0, rc={"font.weight": "bold"})
+
+# 替换文件名中的非法字符
+def sanitize_filename(name):
+    illegal_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+    for char in illegal_chars:
+        name = name.replace(char, '_')
+    return name
+
+# 3倍标准差盖帽法处理异常值
+def cap_outliers_single(X_data, cap_limits=None):
+    X_df = pd.DataFrame(X_data, columns=X_data.columns if hasattr(X_data, 'columns') else None)
+    if cap_limits is None:
+        cap_limits = {}
+        for col in X_df.columns:
+            mean = X_df[col].mean()
+            std = X_df[col].std()
+            upper_limit = mean + 3 * std
+            lower_limit = mean - 3 * std
+            cap_limits[col] = {'均值': mean, '标准差': std, '上限': upper_limit, '下限': lower_limit}
+            X_df[col] = X_df[col].clip(lower=lower_limit, upper=upper_limit)
+    else:
+        for col in X_df.columns:
+            if col in cap_limits:
+                X_df[col] = X_df[col].clip(lower=cap_limits[col]['下限'], upper=cap_limits[col]['上限'])
+    return X_df, cap_limits
+
+# 遗传算法参数初始化函数（实整数编码）
+def create_individual_creator(param_space):
+    def init_individual():
+        ind = []
+        for param, (low, high) in param_space.items():
+            if param in ['n_estimators', 'max_depth', 'min_samples_split', 
+                         'min_samples_leaf', 'bootstrap']:
+                ind.append(random.randint(low, high))
+            elif param == 'max_features':
+                ind.append(random.uniform(low, high))
+        return creator.Individual(ind)
+    return init_individual
+
+# 自定义交叉函数：区分整数/浮点数
+def custom_crossover(ind1, ind2):
+    param_types = [0, 0, 0, 0, 1, 0]  # 0=整数，1=浮点数
+    for i, (type_flag, gene1, gene2) in enumerate(zip(param_types, ind1, ind2)):
+        if random.random() < 0.5:
+            if type_flag == 0:
+                ind1[i], ind2[i] = int((gene1 + gene2) / 2), int((gene1 + gene2) / 2)
+            else:
+                ind1[i], ind2[i] = (gene1 + gene2) / 2, (gene1 + gene2) / 2
+    
+    # 边界校验
+    param_bounds = [
+        (50, 200),    # n_estimators
+        (3, 20),      # max_depth
+        (2, 20),      # min_samples_split
+        (1, 10),      # min_samples_leaf
+        (0.1, 1.0),   # max_features
+        (0, 1)        # bootstrap
+    ]
+    for i, (type_flag, val) in enumerate(zip(param_types, ind1)):
+        low, high = param_bounds[i]
+        if type_flag == 0:
+            ind1[i] = int(max(low, min(high, val)))
+        else:
+            ind1[i] = max(low, min(high, val))
+    for i, (type_flag, val) in enumerate(zip(param_types, ind2)):
+        low, high = param_bounds[i]
+        if type_flag == 0:
+            ind2[i] = int(max(low, min(high, val)))
+        else:
+            ind2[i] = max(low, min(high, val))
+    
+    return ind1, ind2
+
+# 自定义变异函数
+def custom_mutation(ind, indpb):
+    param_types = [0, 0, 0, 0, 1, 0]
+    param_bounds = [
+        (50, 200),    # n_estimators
+        (3, 20),      # max_depth
+        (2, 20),      # min_samples_split
+        (1, 10),      # min_samples_leaf
+        (0.1, 1.0),   # max_features
+        (0, 1)        # bootstrap
+    ]
+    
+    for i in range(len(ind)):
+        if random.random() < indpb:
+            type_flag = param_types[i]
+            low, high = param_bounds[i]
+            
+            if type_flag == 0:
+                mutation_step = random.randint(-5, 5)
+                new_val = ind[i] + mutation_step
+                ind[i] = int(max(low, min(high, new_val)))
+            else:
+                mutation_step = random.gauss(0, 0.1)
+                new_val = ind[i] + mutation_step
+                ind[i] = max(low, min(high, new_val))
+    
+    return ind,
+
+# 遗传算法适应度函数
+def evaluate_individual(individual, X_train, y_train, param_space):
+    params = {}
+    param_names = list(param_space.keys())
+    for i, param in enumerate(param_names):
+        val = individual[i]
+        if param == 'n_estimators':
+            params[param] = int(max(50, min(200, val)))
+        elif param == 'max_depth':
+            val_int = int(max(3, min(20, val)))
+            params[param] = None if val_int == 20 else val_int
+        elif param == 'min_samples_split':
+            params[param] = int(max(2, min(20, val)))
+        elif param == 'min_samples_leaf':
+            params[param] = int(max(1, min(10, val)))
+        elif param == 'max_features':
+            params[param] = max(0.1, min(1.0, val))
+        elif param == 'bootstrap':
+            params[param] = bool(int(max(0, min(1, val))))
+    
+    rf = RandomForestClassifier(
+        **params,
+        random_state=42,
+        class_weight='balanced',
+        n_jobs=-1
+    )
+    
+    try:
+        scores = cross_val_score(rf, X_train, y_train, cv=5, scoring='f1_macro', error_score='raise')
+        return (scores.mean(),)
+    except Exception as e:
+        print(f"参数评估失败：{params}，错误：{str(e)}")
+        return (0.0,)
+
+def main():
+    # 检查Python版本
+    if sys.version_info < (3, 9):
+        print("警告：当前Python版本为{}.{}，建议使用Python3.9环境运行！".format(sys.version_info[0], sys.version_info[1]))
+    
+    print("Please paste the Excel file path below (Example: D:\\WZY\\code\\derivation+filtering+modeling\\feature_derivation\\raw+derived\\all_raw+derived.xlsx)")
+    file_path = input().strip()
+    
+    # 检查文件是否存在
+    if not os.path.exists(file_path):
+        print(f"Error: File '{file_path}' does not exist, please check the path!")
+        return
+    if not file_path.endswith(('.xlsx', '.xls')):
+        print("Error: Please input Excel format files (.xlsx or .xls)!")
+        return
+    
+    # 结果文件夹设置
+    output_dir = os.path.dirname(file_path)
+    if output_dir == "":
+        output_dir = os.getcwd()
+    result_dir = os.path.join(output_dir, "tobacco_rf_ga_optimization_results")
+    os.makedirs(result_dir, exist_ok=True)
+    print(f"\nResults will be saved to: {result_dir}")
+    
+    # 读取数据
+    try:
+        df = pd.read_excel(file_path, engine='openpyxl')
+    except Exception as e1:
+        try:
+            df = pd.read_excel(file_path, engine='xlrd')
+        except Exception as e2:
+            print(f"Error reading file: {str(e2)}")
+            return
+    print(f"Successfully read data: {df.shape[0]} samples, {df.shape[1]} columns")
+    
+    # 数据划分
+    if df.shape[1] < 3:
+        print("Error: Insufficient columns! Need [Sample Label, Flavor Type, at least 1 feature]")
+        return
+    sample_labels = df.iloc[:, 0]
+    y = df.iloc[:, 1]
+    X = df.iloc[:, 2:]
+    
+    # 检查目标变量
+    if not set(y.unique()).issubset({0, 1, 2}):
+        print("Error: Flavor Type must only contain 0, 1, 2!")
+        return
+    
+    # 8:2 划分训练集和测试集
+    print("\n=== Splitting data into training (80%) and test (20%) sets ===")
+    X_train_full, X_test, y_train_full, y_test, sample_labels_train, sample_labels_test = train_test_split(
+        X, y, sample_labels, 
+        test_size=0.2,
+        random_state=42,
+        stratify=y
+    )
+    
+    # 保存训练集和测试集
+    train_df = pd.DataFrame({
+        'Sample_Label': sample_labels_train,
+        'Flavor_Type': y_train_full
+    }).join(X_train_full.reset_index(drop=True))
+    train_df.to_excel(os.path.join(result_dir, 'train_set_80%.xlsx'), index=False)
+    
+    test_df = pd.DataFrame({
+        'Sample_Label': sample_labels_test,
+        'Flavor_Type': y_test
+    }).join(X_test.reset_index(drop=True))
+    test_df.to_excel(os.path.join(result_dir, 'test_set_20%.xlsx'), index=False)
+    
+    print(f"Training set: {X_train_full.shape[0]} samples")
+    print(f"Test set: {X_test.shape[0]} samples (reserved for final evaluation)")
+    
+    # 训练集预处理（用于遗传算法优化）
+    print("\n=== Preprocessing training set ===")
+    # 1. 缺失值填充
+    imputer = SimpleImputer(strategy='median')
+    X_train_imputed = imputer.fit_transform(X_train_full)
+    X_train_imputed_df = pd.DataFrame(X_train_imputed, columns=X.columns, index=sample_labels_train)
+    
+    # 2. 异常值处理
+    X_train_capped, cap_limits = cap_outliers_single(X_train_imputed_df)
+    
+    # 3. 标准化
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_capped)
+    X_train_scaled_df = pd.DataFrame(X_train_scaled, columns=X.columns, index=sample_labels_train)
+    
+    # 保存预处理记录
+    cap_report = pd.DataFrame.from_dict(cap_limits, orient='index')[['均值', '标准差', '下限', '上限']]
+    cap_report.to_excel(os.path.join(result_dir, '0_outlier_capping_records.xlsx'))
+    missing_report = pd.DataFrame({'Feature': X.columns, 'Imputation_Median': imputer.statistics_})
+    missing_report.to_excel(os.path.join(result_dir, '0_missing_value_records.xlsx'), index=False)
+    
+    # -------------------------- 遗传算法优化随机森林 --------------------------
+    # 定义参数空间
+    param_space = {
+        'n_estimators': (50, 200),      # 整数
+        'max_depth': (3, 20),           # 整数
+        'min_samples_split': (2, 20),   # 整数
+        'min_samples_leaf': (1, 10),    # 整数
+        'max_features': (0.1, 1.0),     # 浮点数
+        'bootstrap': (0, 1)             # 整数（0=False/1=True）
+    }
+    
+    # 初始化DEAP
+    if 'FitnessMax' in dir(creator):
+        del creator.FitnessMax
+    if 'Individual' in dir(creator):
+        del creator.Individual
+    
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
+    
+    toolbox = base.Toolbox()
+    individual_creator = create_individual_creator(param_space)
+    toolbox.register("individual", individual_creator)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    
+    # 注册遗传算子
+    toolbox.register("evaluate", evaluate_individual, X_train=X_train_scaled, y_train=y_train_full, param_space=param_space)
+    toolbox.register("mate", custom_crossover)
+    toolbox.register("mutate", custom_mutation, indpb=0.2)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+    
+    # 遗传算法参数
+    POPULATION_SIZE = 100    # 初始种群
+    MAX_GENERATIONS = 50     # 最大迭代次数
+    CXPB = 0.7
+    MUTPB = 0.2
+    
+    # 运行遗传算法
+    print("\n=== Starting Genetic Algorithm Optimization ===")
+    print(f"Population size: {POPULATION_SIZE}, Max generations: {MAX_GENERATIONS}")
+    random.seed(42)
+    pop = toolbox.population(n=POPULATION_SIZE)
+    hof = tools.HallOfFame(1)
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("avg", np.mean)
+    stats.register("std", np.std)
+    stats.register("min", np.min)
+    stats.register("max", np.max)
+    
+    pop, log = algorithms.eaSimple(
+        pop, toolbox,
+        cxpb=CXPB, mutpb=MUTPB,
+        ngen=MAX_GENERATIONS,
+        stats=stats, halloffame=hof,
+        verbose=True
+    )
+    
+    # 解码最优参数
+    best_ind = hof[0]
+    best_params = {}
+    param_names = list(param_space.keys())
+    for i, param in enumerate(param_names):
+        val = best_ind[i]
+        if param == 'n_estimators':
+            best_params[param] = int(val)
+        elif param == 'max_depth':
+            val_int = int(val)
+            best_params[param] = None if val_int == 20 else val_int
+        elif param == 'min_samples_split':
+            best_params[param] = int(val)
+        elif param == 'min_samples_leaf':
+            best_params[param] = int(val)
+        elif param == 'max_features':
+            best_params[param] = float(val)
+        elif param == 'bootstrap':
+            best_params[param] = bool(int(val))
+    
+    # 保存最优参数
+    print("\n=== Best Parameters from GA ===")
+    for k, v in best_params.items():
+        print(f"{k}: {v} (type: {type(v).__name__})")
+    best_params_df = pd.DataFrame([best_params])
+    best_params_df.to_excel(os.path.join(result_dir, '0_best_ga_parameters.xlsx'), index=False)
+    
+    # 保存迭代日志
+    log_df = pd.DataFrame(log)
+    log_df.to_excel(os.path.join(result_dir, '0_ga_iteration_log.xlsx'), index=False)
+    
+    # -------------------------- 测试集评估 --------------------------
+    print("\n=== Evaluating Best Model on Test Set ===")
+    # 预处理测试集
+    X_test_imputed = imputer.transform(X_test)
+    X_test_imputed_df = pd.DataFrame(X_test_imputed, columns=X.columns, index=sample_labels_test)
+    X_test_capped, _ = cap_outliers_single(X_test_imputed_df, cap_limits)
+    X_test_scaled = scaler.transform(X_test_capped)
+    X_test_scaled_df = pd.DataFrame(X_test_scaled, columns=X.columns, index=sample_labels_test)
+    
+    # 训练最优模型
+    best_rf = RandomForestClassifier(
+        **best_params,
+        random_state=42,
+        class_weight='balanced',
+        n_jobs=-1
+    )
+    best_rf.fit(X_train_scaled, y_train_full)
+    
+    # 测试集预测
+    y_test_pred = best_rf.predict(X_test_scaled)
+    y_test_proba = best_rf.predict_proba(X_test_scaled)
+    
+    # 计算测试集指标
+    test_acc = accuracy_score(y_test, y_test_pred)
+    test_precision = precision_score(y_test, y_test_pred, average='macro', zero_division=0)
+    test_recall = recall_score(y_test, y_test_pred, average='macro', zero_division=0)
+    test_f1 = f1_score(y_test, y_test_pred, average='macro', zero_division=0)
+    
+    try:
+        test_auc = roc_auc_score(y_test, y_test_proba, average='macro', multi_class='ovr')
+    except Exception as e:
+        test_auc = None
+        print(f"Warning: AUC calculation failed: {str(e)}")
+    
+    # 保存测试集评估结果
+    test_results = {
+        'Accuracy': f"{test_acc:.3f}",
+        'Precision': f"{test_precision:.3f}",
+        'Recall': f"{test_recall:.3f}",
+        'F1-Score': f"{test_f1:.3f}",
+        'AUC': f"{test_auc:.3f}" if test_auc else "N/A"
+    }
+    test_results_df = pd.DataFrame([test_results])
+    test_results_df.to_excel(os.path.join(result_dir, '1_test_set_evaluation.xlsx'), index=False)
+    
+    print("\n=== Test Set Evaluation Results ===")
+    for metric, value in test_results.items():
+        print(f"{metric}: {value}")
+    
+    # 保存测试集分类报告
+    test_report = classification_report(y_test, y_test_pred, output_dict=True, zero_division=0)
+    test_report_df = pd.DataFrame(test_report).transpose()
+    test_report_df.to_excel(os.path.join(result_dir, '1_test_set_classification_report.xlsx'))
+    
+    # 测试集混淆矩阵
+    plt.figure(figsize=(8, 6))
+    cm = confusion_matrix(y_test, y_test_pred)
+    ax = sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                     xticklabels=[f'Predicted {cls}' for cls in [0, 1, 2]],
+                     yticklabels=[f'Actual {cls}' for cls in [0, 1, 2]],
+                     annot_kws={"weight": "bold"})
+    plt.title('Random Forest Confusion Matrix (Test Set)', fontsize=14)
+    plt.xlabel('Predicted Flavor Type', fontsize=12)
+    plt.ylabel('Actual Flavor Type', fontsize=12)
+    plt.tight_layout()
+    plt.savefig(os.path.join(result_dir, '1_test_set_confusion_matrix.tif'), dpi=600, format='tif')
+    plt.close()
+    
+    # -------------------------- SHAP解释（完整训练集） --------------------------
+    print("\n=== Generating SHAP Explanations ===")
+    try:
+        # 使用完整训练集和最优参数
+        explainer = shap.TreeExplainer(best_rf)
+        shap_values = explainer.shap_values(X_train_scaled_df)
+        n_classes = len(shap_values) if isinstance(shap_values, list) else 1
+        
+        # SHAP全局重要性图
+        plt.figure(figsize=(12, 8))
+        shap.summary_plot(
+            shap_values,
+            X_train_scaled_df,
+            feature_names=X.columns,
+            plot_type="bar",
+            max_display=10,
+            class_names=[f'Class {cls}' for cls in range(n_classes)] if n_classes>1 else ['Class 0'],
+            show=False
+        )
+        ax = plt.gca()
+        ax.set_title('Random Forest Global Feature Importance (Top 10)', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Mean Absolute SHAP Value', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Features', fontsize=12, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(result_dir, '2_shap_global_importance.tif'), dpi=600, format='tif')
+        plt.close()
+        
+        # SHAP蜜蜂图（按类别）
+        if n_classes > 1:
+            for cls in range(n_classes):
+                plt.figure(figsize=(12, 8))
+                shap.summary_plot(
+                    shap_values[cls],
+                    X_train_scaled_df,
+                    feature_names=X.columns,
+                    plot_type="dot",
+                    max_display=10,
+                    show=False
+                )
+                ax = plt.gca()
+                ax.set_title(f'Random Forest SHAP Value Distribution - Class {cls}', fontsize=14, fontweight='bold')
+                ax.set_xlabel('SHAP Value', fontsize=12, fontweight='bold')
+                ax.set_ylabel('Features', fontsize=12, fontweight='bold')
+                plt.tight_layout()
+                plt.savefig(os.path.join(result_dir, f'2_shap_beeswarm_class_{cls}.tif'), dpi=600, format='tif')
+                plt.close()
+        
+        # ========== 新增：SHAP单个特征依赖图 ==========
+        print("Generating SHAP feature dependence plots (Top 10 features)...")
+        # 计算特征重要性，选取前10个特征
+        if n_classes > 1:
+            mean_abs_all = np.mean([np.mean(np.abs(sv), axis=0) for sv in shap_values], axis=0)
+        else:
+            mean_abs_all = np.mean(np.abs(shap_values), axis=0)
+        top10_indices = np.argsort(mean_abs_all)[-10:][::-1]
+        top10_features = X.columns[top10_indices]
+        
+        # 为每个顶级特征生成依赖图（按类别展示）
+        for feat in top10_features:
+            sanitized_feat = sanitize_filename(feat)
+            # 创建3列子图（对应3个类别）
+            fig, ax = plt.subplots(1, 3, figsize=(22, 6), facecolor='white')
+            
+            for cls in range(3):
+                # 生成单个特征的依赖图
+                shap.dependence_plot(
+                    feat,
+                    shap_values[cls] if n_classes>1 else shap_values,
+                    X_train_capped,  # 使用原始缩放前的数据（更易解释）
+                    display_features=X_train_capped,
+                    interaction_index=feat,  # 仅展示自身交互
+                    dot_size=120,
+                    color=y_train_full,      # 按真实类别着色
+                    show=False,
+                    ax=ax[cls]
+                )
+                # 美化图表
+                ax[cls].patch.set_facecolor('white')
+                ax[cls].tick_params(axis='both', which='major', labelsize=18)
+                # X轴添加单位（mg/g），可根据你的数据调整
+                ax[cls].set_xlabel(f'{ax[cls].get_xlabel()} (mg/g)', fontsize=20, fontweight='bold')
+                ax[cls].set_ylabel(ax[cls].get_ylabel(), fontsize=20, fontweight='bold')
+                ax[cls].set_title(f'Class {cls}', fontsize=20, fontweight='bold')
+                # 加粗刻度标签
+                for label in ax[cls].get_xticklabels():
+                    label.set_fontweight('bold')
+                for label in ax[cls].get_yticklabels():
+                    label.set_fontweight('bold')
+            
+            # 设置总标题
+            fig.suptitle(f'Random Forest - Feature Dependence Analysis: {feat}', 
+                         fontsize=22, y=1.02, fontweight='bold')
+            plt.tight_layout()
+            # 保存图片
+            fig.savefig(
+                os.path.join(result_dir, f'2_shap_dependence_{sanitized_feat}.tif'),
+                dpi=600,
+                format='tif',
+                transparent=False
+            )
+            plt.close(fig)
+        
+        print("SHAP feature dependence plots generated successfully!")
+        # ========== 新增结束 ==========
+        
+        print("All SHAP plots generated successfully!")
+    except Exception as e:
+        print(f"Warning: SHAP visualization failed: {str(e)}")
+    
+    print("\n=== All Processes Completed! ===")
+    print(f"All results saved to: {result_dir}")
+    print("\nPython 3.9 Dependencies:")
+    print("pip install pandas==1.5.3 numpy==1.24.3 matplotlib==3.7.1 seaborn==0.12.2")
+    print("pip install openpyxl==3.1.2 xlrd==2.0.1 scikit-learn==1.2.2 shap==0.41.0 deap==1.3.1")
+
+if __name__ == "__main__":
+    main()
