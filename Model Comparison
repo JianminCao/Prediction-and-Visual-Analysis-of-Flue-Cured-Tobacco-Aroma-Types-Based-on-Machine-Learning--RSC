@@ -1,0 +1,497 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import warnings
+import xgboost as xgb
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.preprocessing import StandardScaler, LabelBinarizer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
+                             f1_score, confusion_matrix, classification_report,
+                             roc_auc_score, roc_curve, auc)
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.cross_decomposition import PLSRegression
+
+# 忽略警告
+warnings.filterwarnings('ignore')
+
+# 设置图表样式：新罗马字体、加粗、英文
+plt.rcParams["font.family"] = ["Times New Roman", "DejaVu Serif"]
+plt.rcParams["font.weight"] = "bold"  # 全局加粗
+plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["axes.labelweight"] = "bold"  # 坐标轴标签加粗
+plt.rcParams["axes.titleweight"] = "bold"  # 标题加粗
+plt.rcParams["xtick.major.size"] = 4
+plt.rcParams["ytick.major.size"] = 4
+# 全局设置seaborn字体加粗（通过rc参数）
+sns.set(font='Times New Roman', font_scale=1.0, rc={"font.weight": "bold"})
+
+def main():
+    print("Please paste the Excel file path below (Example: D:\\WZY\\code\\derivation+filtering+modeling\\feature_derivation\\raw+derived\\all_raw+derived.xlsx)")
+    file_path = input().strip()
+    
+    # 检查文件是否存在
+    if not os.path.exists(file_path):
+        print(f"Error: File '{file_path}' does not exist, please check the path!")
+        return
+    if not file_path.endswith(('.xlsx', '.xls')):
+        print("Error: Please input Excel format files (.xlsx or .xls)!")
+        return
+    
+    # 结果文件夹设置
+    output_dir = os.path.dirname(file_path)
+    if output_dir == "":
+        output_dir = os.getcwd()
+    result_dir = os.path.join(output_dir, "tobacco_classification_results")
+    os.makedirs(result_dir, exist_ok=True)
+    print(f"\nResults will be saved to: {result_dir}")
+    
+    # 读取数据
+    try:
+        df = pd.read_excel(file_path, engine='openpyxl')
+    except Exception as e1:
+        try:
+            df = pd.read_excel(file_path, engine='xlrd')
+        except Exception as e2:
+            print(f"Error reading file: {str(e2)}")
+            return
+    print(f"Successfully read data: {df.shape[0]} samples, {df.shape[1]} columns (including labels and features)")
+    
+    # 数据初步划分（样本标签、目标变量、特征）
+    if df.shape[1] < 3:
+        print("Error: Insufficient columns! Need to include [Sample Label (1st column), Flavor Type (2nd column), at least 1 feature]")
+        return
+    sample_labels = df.iloc[:, 0]
+    y = df.iloc[:, 1]
+    X = df.iloc[:, 2:]  # 特征数据（可能含缺失值）
+    
+    # 检查目标变量
+    if not set(y.unique()).issubset({0, 1, 2}):
+        print("Error: The 2nd column 'Flavor Type' must only contain 0, 1, 2!")
+        return
+    
+    # -------------------------- 新增：8:2 划分训练集和测试集 --------------------------
+    print("\n=== Splitting data into training (80%) and test (20%) sets ===")
+    # 分层划分，保证训练集和测试集的类别分布一致
+    X_train_full, X_test, y_train_full, y_test, sample_labels_train, sample_labels_test = train_test_split(
+        X, y, sample_labels, 
+        test_size=0.2,          # 20% 作为测试集
+        random_state=42,        # 固定随机种子保证可复现
+        stratify=y              # 分层抽样
+    )
+    
+    # 保存划分好的训练集和测试集（方便后续使用）
+    # 训练集
+    train_df = pd.DataFrame({
+        'Sample_Label': sample_labels_train,
+        'Flavor_Type': y_train_full
+    }).join(X_train_full.reset_index(drop=True))
+    train_df.to_excel(os.path.join(result_dir, 'train_set_80%.xlsx'), index=False)
+    
+    # 测试集
+    test_df = pd.DataFrame({
+        'Sample_Label': sample_labels_test,
+        'Flavor_Type': y_test
+    }).join(X_test.reset_index(drop=True))
+    test_df.to_excel(os.path.join(result_dir, 'test_set_20%.xlsx'), index=False)
+    
+    print(f"Training set: {X_train_full.shape[0]} samples ({len(X_train_full)/len(X)*100:.1f}%)")
+    print(f"Test set: {X_test.shape[0]} samples ({len(X_test)/len(X)*100:.1f}%) - reserved for future use")
+    print(f"Training set class distribution:")
+    for cls, count in y_train_full.value_counts().sort_index().items():
+        print(f"  Class {cls}: {count} samples (Ratio: {count/len(y_train_full)*100:.1f}%)")
+    print(f"Test set class distribution (reserved):")
+    for cls, count in y_test.value_counts().sort_index().items():
+        print(f"  Class {cls}: {count} samples (Ratio: {count/len(y_test)*100:.1f}%)")
+    
+    # 全局缺失值检测（仅展示，不处理）
+    missing_count = X_train_full.isnull().sum()  # 仅检测训练集缺失值
+    total_missing = missing_count.sum()
+    missing_ratio = total_missing / (X_train_full.shape[0] * X_train_full.shape[1])
+    
+    print("\n=== Global Missing Value Detection Results (Training Set Only) ===")
+    print(f"Total missing values: {total_missing} (Ratio: {missing_ratio:.2%})")
+    if total_missing > 0:
+        print("Features with missing values (Feature Name: Missing Count):")
+        for col, count in missing_count.items():
+            if count > 0:
+                print(f"  - {col}: {count} ({count/X_train_full.shape[0]:.2%})")
+    
+    # 保存训练集类别分布图表（英文、新罗马、600dpi tif）
+    plt.figure(figsize=(8, 5))
+    ax = sns.countplot(x=y_train_full, order=[0, 1, 2])
+    plt.title('Distribution of Flavor Types in Training Set', fontsize=14)
+    plt.xlabel('Flavor Type (0/1/2)', fontsize=12)
+    plt.ylabel('Number of Samples', fontsize=12)
+    for p in ax.patches:
+        ax.annotate(f'{int(p.get_height())}', 
+                    (p.get_x() + p.get_width()/2., p.get_height()),
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(result_dir, '1_flavor_distribution_training_set.tif'), dpi=600, format='tif')
+    plt.close()
+    print("Saved '1_flavor_distribution_training_set.tif'")
+    
+    # 交叉验证设置（仅对训练集进行五折分层交叉验证）
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    
+    # 初始化标签二值化器
+    lb = LabelBinarizer()
+    
+    # -------------------------- 定义数据预处理函数（修复imputer属性问题） --------------------------
+    def preprocess_train_data(X_train):
+        """
+        仅对训练集进行预处理，返回处理后的训练集 + 训练好的预处理对象 + 参数
+        步骤：中位数填充缺失值 → 3σ盖帽法处理异常值 → 标准化
+        """
+        # 1. 中位数填充缺失值（完整fit训练imputer）
+        imputer = SimpleImputer(strategy='median')
+        X_train_imputed = imputer.fit_transform(X_train)  # 完整fit+transform
+        
+        # 2. 3倍标准差盖帽法处理异常值（仅基于训练集）
+        train_mean = np.mean(X_train_imputed, axis=0)
+        train_std = np.std(X_train_imputed, axis=0)
+        upper_bound = train_mean + 3 * train_std
+        lower_bound = train_mean - 3 * train_std
+        
+        # 盖帽法函数（仅处理训练集）
+        def cap_outliers(data, lower, upper):
+            data_capped = np.copy(data)
+            for i in range(data_capped.shape[1]):
+                col_lower = lower[i]
+                col_upper = upper[i]
+                data_capped[data_capped[:, i] < col_lower, i] = col_lower
+                data_capped[data_capped[:, i] > col_upper, i] = col_upper
+            return data_capped
+        
+        X_train_capped = cap_outliers(X_train_imputed, lower_bound, upper_bound)
+        
+        # 3. 标准化（完整fit训练scaler）
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train_capped)  # 完整fit+transform
+        
+        # 汇总预处理对象和参数（用于测试集处理）
+        preprocess_objects = {
+            'imputer': imputer,          # 训练好的imputer对象
+            'scaler': scaler,            # 训练好的scaler对象
+            'outlier_lower': lower_bound,
+            'outlier_upper': upper_bound,
+            'outlier_mean': train_mean,
+            'outlier_std': train_std
+        }
+        
+        # 提取参数用于保存
+        preprocess_params = {
+            'imputer_medians': imputer.statistics_,
+            'outlier_train_mean': train_mean,
+            'outlier_train_std': train_std,
+            'outlier_lower_bound': lower_bound,
+            'outlier_upper_bound': upper_bound,
+            'scaler_mean': scaler.mean_,
+            'scaler_scale': scaler.scale_
+        }
+        
+        return X_train_scaled, preprocess_objects, preprocess_params
+    
+    def preprocess_test_data(X_test, preprocess_objects):
+        """
+        使用训练集训练好的预处理对象转换测试集
+        全程无fit，仅用训练好的对象做transform
+        """
+        # 1. 用训练好的imputer填充缺失值（仅transform）
+        imputer = preprocess_objects['imputer']
+        X_test_imputed = imputer.transform(X_test)
+        
+        # 2. 用训练集的上下限处理测试集异常值
+        lower_bound = preprocess_objects['outlier_lower']
+        upper_bound = preprocess_objects['outlier_upper']
+        
+        def cap_outliers(data, lower, upper):
+            data_capped = np.copy(data)
+            for i in range(data_capped.shape[1]):
+                col_lower = lower[i]
+                col_upper = upper[i]
+                data_capped[data_capped[:, i] < col_lower, i] = col_lower
+                data_capped[data_capped[:, i] > col_upper, i] = col_upper
+            return data_capped
+        
+        X_test_capped = cap_outliers(X_test_imputed, lower_bound, upper_bound)
+        
+        # 3. 用训练好的scaler标准化（仅transform）
+        scaler = preprocess_objects['scaler']
+        X_test_scaled = scaler.transform(X_test_capped)
+        
+        return X_test_scaled
+    
+    # -------------------------- PLS-DA相关函数 --------------------------
+    def plsd_predict(X_train, y_train, X_test):
+        y_train_bin = lb.fit_transform(y_train)
+        temp_pls = PLSRegression(n_components=3, scale=False)
+        temp_pls.fit(X_train, y_train_bin)
+        y_pred_continuous = temp_pls.predict(X_test)
+        y_pred_bin = np.zeros_like(y_pred_continuous)
+        y_pred_bin[np.arange(len(y_pred_continuous)), y_pred_continuous.argmax(axis=1)] = 1
+        y_pred = lb.inverse_transform(y_pred_bin)
+        return y_pred
+
+    def plsd_predict_proba(X_train, y_train, X_test):
+        y_train_bin = lb.fit_transform(y_train)
+        temp_pls = PLSRegression(n_components=3, scale=False)
+        temp_pls.fit(X_train, y_train_bin)
+        y_pred_continuous = temp_pls.predict(X_test)
+        y_pred_proba = np.exp(y_pred_continuous) / np.sum(np.exp(y_pred_continuous), axis=1, keepdims=True)
+        return y_pred_proba
+    
+    # -------------------------- 定义所有模型（删除SVM和Gradient Boosting） --------------------------
+    models = {
+        'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced'),
+        'Decision Tree': DecisionTreeClassifier(random_state=42, class_weight='balanced'),
+        'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced'),
+        'KNN': KNeighborsClassifier(n_neighbors=5),
+        'PLS-DA': PLSRegression(n_components=3, scale=False),
+        'XGBoost': xgb.XGBClassifier(
+            n_estimators=100, 
+            random_state=42, 
+            class_weight='balanced',
+            use_label_encoder=False,
+            eval_metric='mlogloss'
+        )
+    }
+    
+    # 结果存储列表
+    cv_results = []
+    model_params = []
+    # 修改：存储每折的预测结果和混淆矩阵
+    fold_predictions = {name: {'y_true': [], 'y_pred': [], 'y_pred_proba': [], 'confusion_matrices': []} for name in models.keys()}
+    
+    # 保存五折划分信息（仅针对80%的训练集）
+    fold_info = []
+    for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X_train_full, y_train_full)):
+        fold_info.append({
+            'Fold_Index': fold_idx + 1,
+            'Train_Sample_Count': len(train_idx),
+            'Test_Sample_Count': len(test_idx),
+            'Train_Sample_Labels': sample_labels_train.iloc[train_idx].tolist(),
+            'Test_Sample_Labels': sample_labels_train.iloc[test_idx].tolist()
+        })
+    fold_info_df = pd.DataFrame(fold_info)
+    fold_info_df.to_excel(os.path.join(result_dir, '0_fold_division_info_training_set.xlsx'), index=False)
+    print("Saved '0_fold_division_info_training_set.xlsx'")
+    
+    # -------------------------- 五折交叉验证主循环（仅针对80%的训练集） --------------------------
+    for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X_train_full, y_train_full)):
+        print(f"\n=== Processing Fold {fold_idx + 1}/5 (Training Set Only) ===")
+        
+        # 1. 划分当前折的原始训练/测试数据（完全未处理，仅来自80%的训练集）
+        X_train_fold_raw = X_train_full.iloc[train_idx].copy()
+        X_val_fold_raw = X_train_full.iloc[test_idx].copy()  # 这里改为val（验证集）更准确
+        y_train_fold = y_train_full.iloc[train_idx].copy()
+        y_val_fold = y_train_full.iloc[test_idx].copy()
+        
+        # 2. 仅用当前折的训练子集训练预处理逻辑
+        X_train_fold_scaled, preprocess_objects, preprocess_params = preprocess_train_data(X_train_fold_raw)
+        
+        # 3. 用训练集的预处理对象转换当前折的验证子集
+        X_val_fold_scaled = preprocess_test_data(X_val_fold_raw, preprocess_objects)
+        
+        # 保存当前折的预处理参数（用于追溯）
+        fold_process_data = {
+            'Feature_Name': X_train_full.columns,
+            f'Fold_{fold_idx+1}_Imputation_Median': preprocess_params['imputer_medians'],
+            f'Fold_{fold_idx+1}_Outlier_Train_Mean': preprocess_params['outlier_train_mean'],
+            f'Fold_{fold_idx+1}_Outlier_Train_Std': preprocess_params['outlier_train_std'],
+            f'Fold_{fold_idx+1}_Outlier_Lower_Bound': preprocess_params['outlier_lower_bound'],
+            f'Fold_{fold_idx+1}_Outlier_Upper_Bound': preprocess_params['outlier_upper_bound'],
+            f'Fold_{fold_idx+1}_Scaler_Mean': preprocess_params['scaler_mean'],
+            f'Fold_{fold_idx+1}_Scaler_Scale': preprocess_params['scaler_scale']
+        }
+        fold_process_df = pd.DataFrame(fold_process_data)
+        fold_process_df.to_excel(os.path.join(result_dir, f'0_fold_{fold_idx+1}_preprocess_params.xlsx'), index=False)
+        print(f"Saved preprocess parameters for Fold {fold_idx+1}")
+        
+        # 4. 逐个模型训练并预测当前折
+        for model_name, model in models.items():
+            try:
+                # 训练模型（仅用当前折处理后的训练子集）
+                if model_name == 'PLS-DA':
+                    y_pred_fold = plsd_predict(X_train_fold_scaled, y_train_fold, X_val_fold_scaled)
+                    y_pred_proba_fold = plsd_predict_proba(X_train_fold_scaled, y_train_fold, X_val_fold_scaled)
+                else:
+                    model.fit(X_train_fold_scaled, y_train_fold)
+                    y_pred_fold = model.predict(X_val_fold_scaled)
+                    y_pred_proba_fold = model.predict_proba(X_val_fold_scaled) if hasattr(model, 'predict_proba') else None
+                
+                # 存储当前折的预测结果
+                fold_predictions[model_name]['y_true'].extend(y_val_fold.tolist())
+                fold_predictions[model_name]['y_pred'].extend(y_pred_fold.tolist())
+                if y_pred_proba_fold is not None:
+                    fold_predictions[model_name]['y_pred_proba'].extend(y_pred_proba_fold.tolist())
+                
+                # 计算并存储当前折的混淆矩阵
+                cm_fold = confusion_matrix(y_val_fold, y_pred_fold)
+                fold_predictions[model_name]['confusion_matrices'].append(cm_fold)
+                
+            except Exception as e:
+                print(f"Warning: {model_name} failed on Fold {fold_idx+1}: {str(e)}")
+                continue
+    
+    # -------------------------- 模型评估与结果保存（仅基于训练集的五折验证） --------------------------
+    for model_name, model in models.items():
+        print(f"\n=== Evaluating {model_name} (Training Set 5-Fold CV) ===")
+        try:
+            # 保存模型参数
+            params = model.get_params()
+            model_params.append({
+                'Model_Name': model_name,
+                'Parameters': str(params)
+            })
+            
+            # 获取五折合并的预测结果
+            y_true_all = np.array(fold_predictions[model_name]['y_true'])
+            y_pred_all = np.array(fold_predictions[model_name]['y_pred'])
+            y_pred_proba_all = np.array(fold_predictions[model_name]['y_pred_proba']) if len(fold_predictions[model_name]['y_pred_proba']) > 0 else None
+            
+            # 计算整体指标
+            cv_acc = accuracy_score(y_true_all, y_pred_all)
+            cv_precision = precision_score(y_true_all, y_pred_all, average='macro', zero_division=0)
+            cv_recall = recall_score(y_true_all, y_pred_all, average='macro', zero_division=0)
+            cv_f1 = f1_score(y_true_all, y_pred_all, average='macro', zero_division=0)
+            cv_auc = None
+            
+            if y_pred_proba_all is not None and len(y_pred_proba_all) > 0:
+                try:
+                    cv_auc = roc_auc_score(y_true_all, y_pred_proba_all, average='macro', multi_class='ovr')
+                    cv_auc_str = f"{cv_auc:.3f}"
+                except Exception as e:
+                    cv_auc_str = "Calculation Failed"
+                    print(f"Warning: {model_name} AUC calculation failed: {str(e)}")
+            else:
+                cv_auc_str = "Not Supported"
+            
+            # 保存交叉验证结果
+            cv_results.append({
+                'Model_Name': model_name,
+                'CV_Accuracy': f"{cv_acc:.3f}",
+                'CV_Precision': f"{cv_precision:.3f}",
+                'CV_Recall': f"{cv_recall:.3f}",
+                'CV_F1': f"{cv_f1:.3f}",
+                'CV_AUC': cv_auc_str,
+                'Accuracy': cv_acc,
+                'Precision': cv_precision,
+                'Recall': cv_recall,
+                'F1': cv_f1,
+                'AUC': cv_auc
+            })
+            print(f"5-Fold CV Completed: Accuracy {cv_acc:.3f}, F1 {cv_f1:.3f}")
+            
+            # 保存分类报告
+            report = classification_report(y_true_all, y_pred_all, output_dict=True, zero_division=0)
+            report_df = pd.DataFrame(report).transpose()
+            report_df.to_excel(os.path.join(result_dir, f'1_{model_name}_classification_report_training_set.xlsx'))
+            print(f"Saved '{model_name}_classification_report_training_set.xlsx'")
+            
+            # 计算五折混淆矩阵的平均值并取整
+            if len(fold_predictions[model_name]['confusion_matrices']) > 0:
+                # 堆叠所有折的混淆矩阵并计算平均值
+                cm_list = np.array(fold_predictions[model_name]['confusion_matrices'])
+                avg_cm = np.mean(cm_list, axis=0)
+                # 数值取整
+                avg_cm = np.round(avg_cm).astype(int)
+                
+                # 绘制平均混淆矩阵
+                plt.figure(figsize=(8, 6))
+                ax = sns.heatmap(avg_cm, annot=True, fmt='d', cmap='Blues',
+                                xticklabels=[f'Predicted {cls}' for cls in [0, 1, 2]],
+                                yticklabels=[f'Actual {cls}' for cls in [0, 1, 2]],
+                                annot_kws={"weight": "bold"})  # 标注加粗
+                plt.title(f'{model_name} Average Confusion Matrix (Training Set 5-Fold CV)', fontsize=14)
+                plt.xlabel('Predicted Flavor Type', fontsize=12)
+                plt.ylabel('Actual Flavor Type', fontsize=12)
+                plt.tight_layout()
+                plt.savefig(os.path.join(result_dir, f'2_{model_name}_confusion_matrix_training_set.tif'), dpi=600, format='tif')
+                plt.close()
+                print(f"Saved '{model_name}_confusion_matrix_training_set.tif' (average of 5 folds)")
+            else:
+                print(f"Warning: No confusion matrices found for {model_name}")
+            
+            # 绘制ROC曲线（修复lw/linewidth冲突问题）
+            if y_pred_proba_all is not None and cv_auc is not None:
+                plt.figure(figsize=(8, 6))
+                n_classes = 3
+                colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+                
+                for i in range(n_classes):
+                    fpr, tpr, _ = roc_curve((y_true_all == i).astype(int), y_pred_proba_all[:, i])
+                    roc_auc_i = auc(fpr, tpr)
+                    # 修复：只保留linewidth参数，删除lw别名
+                    plt.plot(fpr, tpr, color=colors[i], linewidth=2,
+                             label=f'Class {i} (AUC = {roc_auc_i:.3f})')
+                
+                # 修复：只保留linewidth参数，删除lw别名
+                plt.plot([0, 1], [0, 1], 'k--', linewidth=2, label='Random Guess')
+                plt.xlim([0.0, 1.0])
+                plt.ylim([0.0, 1.05])
+                plt.xlabel('False Positive Rate (FPR)', fontsize=12)
+                plt.ylabel('True Positive Rate (TPR)', fontsize=12)
+                plt.title(f'{model_name} ROC Curve (Training Set 5-Fold CV, Multi-Class)', fontsize=14)
+                plt.legend(loc='lower right', fontsize=10)
+                plt.tight_layout()
+                plt.savefig(os.path.join(result_dir, f'3_{model_name}_roc_curve_training_set.tif'), dpi=600, format='tif')
+                plt.close()
+                print(f"Saved '{model_name}_roc_curve_training_set.tif'")
+        
+        except Exception as e:
+            print(f"Error: {model_name} evaluation failed: {str(e)}")
+            continue
+    
+    # 保存模型参数
+    params_df = pd.DataFrame(model_params)
+    params_df.to_excel(os.path.join(result_dir, '0_model_parameters.xlsx'), index=False)
+    print("\nSaved '0_model_parameters.xlsx'")
+    
+    # 保存交叉验证结果汇总
+    cv_summary_df = pd.DataFrame(cv_results)[['Model_Name', 'CV_Accuracy', 'CV_Precision', 
+                                              'CV_Recall', 'CV_F1', 'CV_AUC']]
+    cv_summary_df.to_excel(os.path.join(result_dir, '4_cv_results_summary_training_set.xlsx'), index=False)
+    print("Saved 5-fold CV results summary table (Training Set Only)")
+    
+    # 绘制模型对比图（英文、600dpi tif）
+    if len(cv_results) > 0:
+        cv_plot_df = pd.DataFrame(cv_results)
+        metrics = ['Accuracy', 'Precision', 'Recall', 'F1']
+        if cv_plot_df['AUC'].notna().any():
+            metrics.append('AUC')
+        
+        plt.figure(figsize=(12, 8))
+        x = np.arange(len(cv_plot_df))
+        width = 0.15
+        
+        for i, metric in enumerate(metrics):
+            values = cv_plot_df[metric].fillna(0)
+            # 修复：删除重复的linewidth参数
+            plt.bar(x + i*width, values, width, label=metric, alpha=0.8, linewidth=1.5, edgecolor='black')
+        
+        plt.xlabel('Classification Models', fontsize=12)
+        plt.ylabel('Evaluation Metrics (Higher is Better)', fontsize=12)
+        plt.title('5-Fold CV Performance Comparison (Training Set Only)', fontsize=14)
+        plt.xticks(x + width*(len(metrics)-1)/2, cv_plot_df['Model_Name'], rotation=45, ha='right', fontweight='bold')
+        plt.ylim(0, 1.0)
+        plt.legend(loc='lower center', bbox_to_anchor=(0.5, -0.15), ncol=5, fontsize=10)
+        plt.tight_layout()
+        plt.savefig(os.path.join(result_dir, '5_model_performance_comparison_training_set.tif'), dpi=600, format='tif')
+        plt.close()
+        print("Saved 5-fold CV model performance comparison plot (Training Set Only)")
+    
+    print("\n=== All Modeling Processes Completed! ===")
+    print(f"All result files saved to: {result_dir}")
+    print(f"\nImportant Note:")
+    print(f"1. Test set (20%) is saved as 'test_set_20%.xlsx' - not used in training/evaluation")
+    print(f"2. Training set (80%) is saved as 'train_set_80%.xlsx' - used for 5-fold CV")
+
+if __name__ == "__main__":
+    main()
