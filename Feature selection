@@ -1,0 +1,829 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+import seaborn as sns
+import os
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score, KFold, StratifiedKFold  # 新增StratifiedKFold
+import warnings
+warnings.filterwarnings('ignore')
+
+# 设置字体为新罗马字体（Times New Roman），移除中文显示相关设置
+plt.rcParams["font.family"] = ["Times New Roman", "DejaVu Serif"]
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+# 全局设置字体加粗和增大基础字号（仅支持部分参数）- 基础字号从13减小为12（整体再减小一号）
+plt.rcParams['font.weight'] = 'bold'    # 全局字体加粗
+plt.rcParams['axes.labelweight'] = 'bold'  # 坐标轴标签加粗
+plt.rcParams['axes.titleweight'] = 'bold'  # 标题加粗
+plt.rcParams['font.size'] = 12  # 基础字号从13减小为12（整体减小一号）
+# 调整：关闭自动布局，恢复边框显示
+plt.rcParams['figure.autolayout'] = False  # 关闭自动布局，手动控制
+plt.rcParams['axes.spines.top'] = True    # 恢复顶部边框
+plt.rcParams['axes.spines.right'] = True  # 恢复右侧边框
+plt.rcParams['axes.linewidth'] = 1.2      # 边框宽度保持
+# 新增：全局设置图表背景色为白色
+plt.rcParams['figure.facecolor'] = 'white'
+plt.rcParams['axes.facecolor'] = 'white'
+
+class TobaccoFeatureSelector:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.data = None
+        self.sample_labels = None
+        self.flavor_types = None
+        self.features = None
+        self.processed_data = None  # 标准化后→分离度筛选后更新
+        self.rf_importance = None
+        self.top10_features = None  # 随机森林选的top10→相关性分析后更新
+        self.separation_results = None
+        self.correlation_matrix = None  # 新增：top10特征相关系数矩阵
+        self.deleted_features = None    # 新增：被删除的冗余特征列表
+        self.rf_model = None  # 新增：存储随机森林模型
+        self.rf_train_test_info = None  # 新增：存储训练测试集划分信息
+        self.cv_scores = None  # 新增：存储五折交叉验证分数
+        # 新增：保存训练测试集数据，避免作用域问题（改为存储各折数据）
+        self.fold_data = {}  # 存储各折的训练/测试数据和预处理参数
+        self.average_importance = None  # 存储五折平均特征重要性
+        
+        self.output_dir = os.path.dirname(file_path)
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+    
+    # ---------------------- 原有方法（基础修改：字体减小一号） ----------------------
+    def load_data(self):
+        print("正在读取数据...")
+        self.data = pd.read_excel(self.file_path)
+        self.sample_labels = self.data.iloc[:, 0]
+        self.flavor_types = self.data.iloc[:, 1]
+        self.features = self.data.iloc[:, 2:]
+        
+        info_df = pd.DataFrame({
+            '样品数量': [self.data.shape[0]],
+            '特征数量': [self.features.shape[1]],
+            '清甜型样品数': [(self.flavor_types == 0).sum()],
+            '蜜甜型样品数': [(self.flavor_types == 1).sum()],
+            '醇甜型样品数': [(self.flavor_types == 2).sum()]
+        })
+        info_path = os.path.join(self.output_dir, '数据基本信息.xlsx')
+        info_df.to_excel(info_path, index=False)
+        print(f"数据基本信息已保存至: {info_path}")
+        return self
+    
+    def handle_outliers(self):
+        print("正在处理异常值...")
+        processed = self.features.copy()
+        means = processed.mean()
+        stds = processed.std()
+        outlier_counts = {}
+        
+        for col in processed.columns:
+            mean = means[col]
+            std = stds[col]
+            upper_limit = mean + 3 * std
+            lower_limit = mean - 3 * std
+            
+            outliers = (processed[col] > upper_limit) | (processed[col] < lower_limit)
+            outlier_counts[col] = outliers.sum()
+            
+            processed[col] = np.where(processed[col] > upper_limit, upper_limit, processed[col])
+            processed[col] = np.where(processed[col] < lower_limit, lower_limit, processed[col])
+        
+        self.processed_data = processed
+        self._plot_outlier_comparison(outlier_counts)
+        
+        outlier_df = pd.DataFrame(list(outlier_counts.items()), columns=['特征', '异常值数量'])
+        outlier_path = os.path.join(self.output_dir, '异常值统计.xlsx')
+        outlier_df.to_excel(outlier_path, index=False)
+        print(f"异常值统计已保存至: {outlier_path}")
+        return self
+    
+    def _plot_outlier_comparison(self, outlier_counts):
+        top_outliers = sorted(outlier_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        top_features = [x[0] for x in top_outliers]
+        
+        fig, axes = plt.subplots(2, 5, figsize=(20, 10))
+        axes = axes.flatten()
+        
+        for i, feature in enumerate(top_features):
+            # 设置子图背景色为白色
+            axes[i].set_facecolor('white')
+            sns.kdeplot(self.features[feature], ax=axes[i], label='Original data', fill=True, alpha=0.7)
+            sns.kdeplot(self.processed_data[feature], ax=axes[i], label='Processed data', fill=True, alpha=0.7)
+            axes[i].set_title(f'{feature} Outlier Comparison', fontsize=16, fontweight='bold')
+            axes[i].legend(fontsize=14, frameon=False)
+            axes[i].tick_params(axis='both', labelsize=14, width=2)
+            for label in axes[i].get_xticklabels():
+                label.set_weight('bold')
+                try:
+                    label.set_text(f"{float(label.get_text()):.2f}")
+                except:
+                    pass
+            for label in axes[i].get_yticklabels():
+                label.set_weight('bold')
+            axes[i].spines['top'].set_visible(True)
+            axes[i].spines['right'].set_visible(True)
+        
+        # 设置整个图表背景色为白色
+        fig.patch.set_facecolor('white')
+        plt.tight_layout(pad=2.0)
+        plot_path = os.path.join(self.output_dir, '异常值处理对比图.tif')
+        plt.savefig(plot_path, dpi=600, format='tif', bbox_inches='tight', facecolor='white', edgecolor='none')
+        plt.close()
+        print(f"异常值处理对比图已保存至: {plot_path}")
+    
+    def standardize_data(self):
+        print("正在进行标准化处理...")
+        scaler = StandardScaler()
+        standardized_data = scaler.fit_transform(self.processed_data)
+        self.processed_data = pd.DataFrame(standardized_data, columns=self.processed_data.columns)
+        self._plot_standardization_comparison(scaler)
+        return self
+    
+    def _plot_standardization_comparison(self, scaler):
+        sample_features = self.processed_data.columns[:5]
+        
+        fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+        
+        for i, feature in enumerate(sample_features):
+            # 设置子图背景色为白色
+            axes[i].set_facecolor('white')
+            original_data = self.processed_data[feature] * scaler.scale_[i] + scaler.mean_[i]
+            sns.kdeplot(original_data, ax=axes[i], label='Before standardization', fill=True, alpha=0.7)
+            sns.kdeplot(self.processed_data[feature], ax=axes[i], label='After standardization', fill=True, alpha=0.7)
+            axes[i].set_title(f'{feature} Standardization Comparison', fontsize=16, fontweight='bold')
+            axes[i].legend(fontsize=14, frameon=False)
+            axes[i].tick_params(axis='both', labelsize=14, width=2)
+            for label in axes[i].get_xticklabels():
+                label.set_weight('bold')
+                try:
+                    label.set_text(f"{float(label.get_text()):.2f}")
+                except:
+                    pass
+            for label in axes[i].get_yticklabels():
+                label.set_weight('bold')
+            axes[i].spines['top'].set_visible(True)
+            axes[i].spines['right'].set_visible(True)
+        
+        # 设置整个图表背景色为白色
+        fig.patch.set_facecolor('white')
+        plt.tight_layout(pad=2.0)
+        plot_path = os.path.join(self.output_dir, '标准化对比图.tif')
+        plt.savefig(plot_path, dpi=600, format='tif', bbox_inches='tight', facecolor='white', edgecolor='none')
+        plt.close()
+        print(f"标准化对比图已保存至: {plot_path}")
+    
+    def separation_analysis(self):
+        """计算分离度（f01/f12/f02/f012），任意一指标f>0.8的特征进入后续流程"""
+        print("正在进行特征分离度分析...")
+        group0 = self.processed_data[self.flavor_types == 0]
+        group1 = self.processed_data[self.flavor_types == 1]
+        group2 = self.processed_data[self.flavor_types == 2]
+        
+        separation_list = []
+        for feature in self.processed_data.columns:
+            mean0, std0 = group0[feature].mean(), group0[feature].std()
+            mean1, std1 = group1[feature].mean(), group1[feature].std()
+            mean2, std2 = group2[feature].mean(), group2[feature].std()
+            
+            denominator01 = std0 + std1
+            f01 = 1.18 * abs(mean0 - mean1) / denominator01 if denominator01 != 0 else np.inf
+            denominator12 = std1 + std2
+            f12 = 1.18 * abs(mean1 - mean2) / denominator12 if denominator12 != 0 else np.inf
+            denominator02 = std0 + std2
+            f02 = 1.18 * abs(mean0 - mean2) / denominator02 if denominator02 != 0 else np.inf
+            
+            valid_f = [f for f in [f01, f12, f02] if f != np.inf]
+            f012 = np.mean(valid_f) if valid_f else np.inf
+            
+            def get_separation_ability(f_val):
+                if f_val == np.inf:
+                    return "无意义（分母为0）"
+                elif f_val > 1.25:
+                    return "几乎完全分离"
+                elif f_val > 1.0:
+                    return "分离能力良好"
+                elif f_val > 0.8:
+                    return "具有一定分离能力"
+                else:
+                    return "无有效分离能力"
+            
+            separation_list.append({
+                '特征': feature,
+                'f01（清甜-蜜甜）': round(f01, 4) if f01 != np.inf else "—",
+                'f01分离能力': get_separation_ability(f01),
+                'f12（蜜甜-醇甜）': round(f12, 4) if f12 != np.inf else "—",
+                'f12分离能力': get_separation_ability(f12),
+                'f02（清甜-醇甜）': round(f02, 4) if f02 != np.inf else "—",
+                'f02分离能力': get_separation_ability(f02),
+                'f012（综合分离度）': round(f012, 4) if f012 != np.inf else "—",
+                'f012分离能力': get_separation_ability(f012)
+            })
+        
+        self.separation_results = pd.DataFrame(separation_list).sort_values('f012（综合分离度）', ascending=False)
+        separation_path = os.path.join(self.output_dir, '特征分离度结果.xlsx')
+        self.separation_results.to_excel(separation_path, index=False)
+        print(f"特征分离度结果已保存至: {separation_path}")
+        
+        # 筛选任意一f>0.8的特征
+        valid_features_df = self.separation_results[
+            (self.separation_results['f01（清甜-蜜甜）'] != "—") &
+            (self.separation_results['f12（蜜甜-醇甜）'] != "—") &
+            (self.separation_results['f02（清甜-醇甜）'] != "—")
+        ].copy()
+        valid_features_df['f01数值'] = valid_features_df['f01（清甜-蜜甜）'].astype(float)
+        valid_features_df['f12数值'] = valid_features_df['f12（蜜甜-醇甜）'].astype(float)
+        valid_features_df['f02数值'] = valid_features_df['f02（清甜-醇甜）'].astype(float)
+        selected_features = valid_features_df[
+            (valid_features_df['f01数值'] > 0.8) | 
+            (valid_features_df['f12数值'] > 0.8) | 
+            (valid_features_df['f02数值'] > 0.8)
+        ]['特征'].tolist()
+        
+        self.processed_data = self.processed_data[selected_features]
+        print(f"分离度筛选后保留 {len(selected_features)} 个特征（任意一指标f>0.8）")
+        
+        self._plot_separation_results()
+        return self
+    
+    def _plot_separation_results(self):
+        valid_sep = self.separation_results[self.separation_results['f012（综合分离度）'] != "—"].copy()
+        valid_sep['f012数值'] = valid_sep['f012（综合分离度）'].astype(float)
+        top15_sep = valid_sep.nlargest(15, 'f012数值')
+        
+        plt.figure(figsize=(14, 9))
+        # 设置图表背景色为白色
+        plt.gca().set_facecolor('white')
+        bars = sns.barplot(x='f012数值', y='特征', data=top15_sep, palette='cividis', alpha=0.85)
+        
+        plt.axvline(x=0.8, color='red', linestyle='--', alpha=0.7, label='Filter threshold: 0.8 (Any index meets)')
+        plt.axvline(x=1.0, color='orange', linestyle='--', alpha=0.7, label='Separation threshold: 1.0 (Good)')
+        plt.axvline(x=1.25, color='green', linestyle='--', alpha=0.7, label='Separation threshold: 1.25 (Complete)')
+        
+        plt.title('Top 15 Features by Comprehensive Separation Degree (f012)', fontsize=22, fontweight='bold')
+        plt.xlabel('f012 (Comprehensive Separation Degree)', fontsize=20, fontweight='bold')
+        plt.ylabel('Features', fontsize=20, fontweight='bold')
+        plt.xticks(fontsize=18)
+        ax = plt.gca()
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f"{x:.2f}"))
+        plt.yticks(fontsize=18)
+        plt.legend(fontsize=16, frameon=False)
+        
+        for bar in bars.patches:
+            width = bar.get_width()
+            plt.text(width + 0.02, bar.get_y() + bar.get_height()/2, 
+                     f'{width:.2f}', ha='left', va='center', fontsize=16, fontweight='bold')
+        
+        # 设置整个图表背景色为白色
+        plt.gcf().patch.set_facecolor('white')
+        plt.tight_layout(pad=1.5)
+        plot_path = os.path.join(self.output_dir, '特征分离度前15特征.tif')
+        plt.savefig(plot_path, dpi=600, format='tif', bbox_inches='tight', facecolor='white', edgecolor='none')
+        plt.close()
+        print(f"特征分离度图表已保存至: {plot_path}")
+    
+    # ---------------------- 核心修改：随机森林改为五折分层交叉验证，每折独立预处理 ----------------------
+    def _process_fold_data(self, X_train_raw, X_test_raw):
+        """
+        对单折数据进行独立预处理：异常值处理 + 标准化
+        返回处理后的训练/测试数据，以及预处理参数（异常值上下限、scaler）
+        """
+        # 1. 异常值处理（仅基于训练集计算上下限）
+        train_processed = X_train_raw.copy()
+        test_processed = X_test_raw.copy()
+        
+        # 计算训练集的均值和标准差
+        train_means = train_processed.mean()
+        train_stds = train_processed.std()
+        
+        # 存储每列的异常值上下限
+        outlier_limits = {}
+        
+        for col in train_processed.columns:
+            mean = train_means[col]
+            std = train_stds[col]
+            upper_limit = mean + 3 * std
+            lower_limit = mean - 3 * std
+            outlier_limits[col] = (lower_limit, upper_limit)
+            
+            # 处理训练集异常值
+            train_processed[col] = np.where(train_processed[col] > upper_limit, upper_limit, train_processed[col])
+            train_processed[col] = np.where(train_processed[col] < lower_limit, lower_limit, train_processed[col])
+            
+            # 用训练集的上下限处理测试集异常值
+            test_processed[col] = np.where(test_processed[col] > upper_limit, upper_limit, test_processed[col])
+            test_processed[col] = np.where(test_processed[col] < lower_limit, lower_limit, test_processed[col])
+        
+        # 2. 标准化（仅拟合训练集）
+        scaler = StandardScaler()
+        train_standardized = scaler.fit_transform(train_processed)
+        test_standardized = scaler.transform(test_processed)
+        
+        # 转换为DataFrame
+        X_train_processed = pd.DataFrame(train_standardized, columns=X_train_raw.columns, index=X_train_raw.index)
+        X_test_processed = pd.DataFrame(test_standardized, columns=X_test_raw.columns, index=X_test_raw.index)
+        
+        return {
+            'X_train_processed': X_train_processed,
+            'X_test_processed': X_test_processed,
+            'outlier_limits': outlier_limits,
+            'scaler': scaler
+        }
+    
+    def random_forest_selection(self):
+        """
+        修改为：使用五折分层交叉验证，每折独立预处理，计算平均特征重要性
+        取消固定训练/测试集划分
+        """
+        print("正在进行随机森林重要性分析（五折分层交叉验证，每折独立预处理）...")
+        
+        # 准备原始特征数据（分离度筛选后的原始数据，未处理异常值和标准化）
+        X_raw = self.features[self.processed_data.columns]  # 仅保留分离度筛选后的特征
+        y = self.flavor_types
+        sample_labels = self.sample_labels
+        
+        # 初始化五折分层交叉验证
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        fold_importances = []  # 存储各折的特征重要性
+        fold_scores = []       # 存储各折的测试集准确率
+        self.fold_data = {}    # 存储各折的详细信息
+        
+        # 遍历每一折
+        for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X_raw, y), 1):
+            print(f"\n处理第 {fold_idx} 折数据...")
+            
+            # 1. 划分该折的原始训练/测试数据
+            X_train_raw = X_raw.iloc[train_idx]
+            X_test_raw = X_raw.iloc[test_idx]
+            y_train = y.iloc[train_idx]
+            y_test = y.iloc[test_idx]
+            sample_train = sample_labels.iloc[train_idx]
+            sample_test = sample_labels.iloc[test_idx]
+            
+            # 2. 该折数据独立预处理（异常值处理 + 标准化）
+            fold_processed = self._process_fold_data(X_train_raw, X_test_raw)
+            X_train_processed = fold_processed['X_train_processed']
+            X_test_processed = fold_processed['X_test_processed']
+            
+            # 3. 训练随机森林模型
+            rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
+            rf_model.fit(X_train_processed, y_train)
+            
+            # 4. 评估该折性能
+            fold_accuracy = rf_model.score(X_test_processed, y_test)
+            fold_scores.append(fold_accuracy)
+            
+            # 5. 记录该折的特征重要性
+            fold_importance = pd.DataFrame({
+                '特征': X_raw.columns,
+                '重要性': rf_model.feature_importances_,
+                '折数': fold_idx
+            })
+            fold_importances.append(fold_importance)
+            
+            # 6. 存储该折的所有信息
+            self.fold_data[f'fold_{fold_idx}'] = {
+                'train_idx': train_idx,
+                'test_idx': test_idx,
+                'X_train_raw': X_train_raw,
+                'X_test_raw': X_test_raw,
+                'X_train_processed': X_train_processed,
+                'X_test_processed': X_test_processed,
+                'y_train': y_train,
+                'y_test': y_test,
+                'sample_train': sample_train,
+                'sample_test': sample_test,
+                'model': rf_model,
+                'accuracy': fold_accuracy,
+                'outlier_limits': fold_processed['outlier_limits'],
+                'scaler': fold_processed['scaler']
+            }
+            
+            print(f"第 {fold_idx} 折测试集准确率: {fold_accuracy:.4f}")
+        
+        # 7. 计算五折平均特征重要性
+        all_importances = pd.concat(fold_importances, ignore_index=True)
+        self.average_importance = all_importances.groupby('特征')['重要性'].mean().reset_index()
+        self.average_importance = self.average_importance.sort_values('重要性', ascending=False)
+        
+        # 8. 计算交叉验证整体结果
+        self.cv_scores = np.array(fold_scores)
+        self.rf_importance = self.average_importance  # 平均重要性作为最终重要性
+        
+        # 9. 保存五折交叉验证信息
+        cv_info_df = pd.DataFrame({
+            '折数': [f'第{i}折' for i in range(1, 6)],
+            '测试集准确率': [round(score, 4) for score in fold_scores],
+            '训练集样品数': [len(self.fold_data[f'fold_{i}']['X_train_raw']) for i in range(1, 6)],
+            '测试集样品数': [len(self.fold_data[f'fold_{i}']['X_test_raw']) for i in range(1, 6)]
+        })
+        # 添加汇总行
+        summary_row = pd.DataFrame({
+            '折数': ['平均值', '标准差', '最高分', '最低分'],
+            '测试集准确率': [
+                round(self.cv_scores.mean(), 4),
+                round(self.cv_scores.std(), 4),
+                round(self.cv_scores.max(), 4),
+                round(self.cv_scores.min(), 4)
+            ],
+            '训练集样品数': ['—'] * 4,
+            '测试集样品数': ['—'] * 4
+        })
+        cv_info_df = pd.concat([cv_info_df, summary_row], ignore_index=True)
+        cv_info_path = os.path.join(self.output_dir, '五折交叉验证结果.xlsx')
+        cv_info_df.to_excel(cv_info_path, index=False)
+        print(f"\n五折交叉验证结果已保存至: {cv_info_path}")
+        
+        # 10. 处理特征重要性排名（兼容不足10个的情况）
+        total_features = len(self.average_importance)
+        select_n = min(10, total_features)
+        top_n_importance = self.average_importance.head(select_n).copy()
+        top_n_importance['排名'] = range(1, select_n + 1)
+        top_n_importance = top_n_importance[['排名', '特征', '重要性']]
+        
+        # 保存重要性数据
+        top_importance_path = os.path.join(self.output_dir, '随机森林重要性特征排名.xlsx')
+        top_n_importance.to_excel(top_importance_path, index=False)
+        print(f"随机森林平均重要性特征排名（前{select_n}个）已保存至: {top_importance_path}")
+        
+        # 11. 保存筛选特征的原始数据和标准化数据
+        rf_selected_features = top_n_importance['特征'].tolist()
+        
+        # 原始数据
+        rf_selected_data = pd.concat([
+            self.sample_labels.reset_index(drop=True),
+            self.flavor_types.reset_index(drop=True),
+            self.data[rf_selected_features].reset_index(drop=True)
+        ], axis=1)
+        rf_selected_data.columns = [self.data.columns[0], self.data.columns[1]] + rf_selected_features
+        rf_data_path = os.path.join(self.output_dir, '随机森林筛选特征原始数据.xlsx')
+        rf_selected_data.to_excel(rf_data_path, index=False)
+        print(f"随机森林筛选特征原始数据（前{select_n}个）已保存至: {rf_data_path}")
+        
+        # 标准化数据（使用全量数据的标准化结果）
+        rf_standardized_data = pd.concat([
+            self.sample_labels.reset_index(drop=True),
+            self.flavor_types.reset_index(drop=True),
+            self.processed_data[rf_selected_features].reset_index(drop=True)
+        ], axis=1)
+        rf_standardized_data.columns = [self.data.columns[0], self.data.columns[1]] + rf_selected_features
+        rf_standardized_path = os.path.join(self.output_dir, '随机森林筛选特征标准化数据.xlsx')
+        rf_standardized_data.to_excel(rf_standardized_path, index=False)
+        print(f"随机森林筛选特征标准化数据（前{select_n}个）已保存至: {rf_standardized_path}")
+        
+        # 12. 保存全部特征的平均重要性
+        rf_path = os.path.join(self.output_dir, '随机森林特征重要性.xlsx')
+        self.average_importance.to_excel(rf_path, index=False)
+        print(f"随机森林平均特征重要性结果已保存至: {rf_path}")
+        
+        # 13. 保存模型结构信息
+        model_structure = pd.DataFrame({
+            '模型结构信息': [
+                f'模型类型: RandomForestClassifier（随机森林分类器）',
+                f'决策树数量: 100',
+                f'随机种子: 42',
+                f'交叉验证方式: 五折分层交叉验证（StratifiedKFold）',
+                f'每折预处理: 独立异常值处理 + 独立标准化',
+                f'五折平均测试集准确率: {self.cv_scores.mean():.4f}',
+                f'五折准确率标准差: {self.cv_scores.std():.4f}',
+                f'五折最高准确率: {self.cv_scores.max():.4f}',
+                f'五折最低准确率: {self.cv_scores.min():.4f}',
+                f'特征重要性计算方式: 五折平均基尼系数（Gini）'
+            ]
+        })
+        model_structure_path = os.path.join(self.output_dir, '随机森林模型结构信息.xlsx')
+        model_structure.to_excel(model_structure_path, index=False)
+        print(f"随机森林模型结构信息已保存至: {model_structure_path}")
+        
+        # 14. 绘制重要性图
+        self._plot_rf_importance()
+        
+        # 15. 确定最终筛选的topN特征
+        self.top10_features = rf_selected_features
+        print(f"\n随机森林分析后选取 {len(self.top10_features)} 个重要特征（最多选取10个）")
+        return self
+    
+    def _plot_rf_importance(self):
+        """修改：移除数值标记，保证宽度一致，增强边框线"""
+        # 绘制最多10个特征的平均重要性图
+        top_features = self.average_importance.head(min(10, len(self.average_importance))).copy()
+        
+        # 固定图片尺寸，确保宽度一致
+        fig_width = 12
+        fig_height = 8
+        plt.figure(figsize=(fig_width, fig_height))
+        
+        # 设置坐标轴背景色和整个图表背景色为白色
+        ax = plt.gca()
+        ax.set_facecolor('white')
+        plt.gcf().patch.set_facecolor('white')
+        
+        # 绘制条形图，设置固定宽度确保所有柱状图宽度一致
+        bars = sns.barplot(
+            x='重要性', 
+            y='特征', 
+            data=top_features, 
+            palette='plasma', 
+            alpha=0.85,
+            edgecolor='black',  # 添加黑色边框增强视觉效果
+            linewidth=1.2,      # 边框宽度
+            width=0.6           # 固定柱状图宽度，确保一致性
+        )
+        
+        # 设置标签和标题样式
+        plt.xlabel('Average Importance Score (5-Fold CV)', fontsize=20, fontweight='bold')
+        plt.ylabel('Features', fontsize=20, fontweight='bold')
+        
+        # 设置刻度样式
+        plt.xticks(fontsize=18, fontweight='bold')
+        ax.xaxis.set_major_formatter(plt.FormatStrFormatter('%.2f'))
+        min_val = 0
+        max_val = top_features['重要性'].max() + 0.02
+        ax.set_xlim(min_val, max_val)
+        
+        plt.yticks(fontsize=18, fontweight='bold')
+        
+        # ---------------------- 关键修改1：移除数值标记 ----------------------
+        # 已删除原有的数值标签添加代码
+        
+        # ---------------------- 关键修改2：增强边框线 ----------------------
+        # 增强边框样式 - 为整个图表添加明显的边框
+        ax.spines['top'].set_visible(True)
+        ax.spines['right'].set_visible(True)
+        # 进一步加粗坐标轴边框
+        ax.spines['left'].set_linewidth(1.0)     # 加粗左侧边框
+        ax.spines['bottom'].set_linewidth(1.0)   # 加粗底部边框
+        ax.spines['top'].set_linewidth(0.5)      # 加粗顶部边框
+        ax.spines['right'].set_linewidth(0.5)    # 加粗右侧边框
+        # 设置边框颜色为黑色
+        ax.spines['left'].set_color('black')
+        ax.spines['bottom'].set_color('black')
+        ax.spines['top'].set_color('black')
+        ax.spines['right'].set_color('black')
+        
+        # ---------------------- 关键修改3：保证宽度一致 ----------------------
+        # 统一边距设置，确保除y轴名称外宽度一致
+        plt.subplots_adjust(
+            left=0.35,    # 固定左侧边距（给y轴名称留空间）
+            right=0.95,   # 固定右侧边距
+            top=0.9,      # 固定顶部边距
+            bottom=0.1,   # 固定底部边距
+            wspace=0,     # 无水平间距
+            hspace=0      # 无垂直间距
+        )
+        
+        # ---------------------- 修复语法错误：移除重复的bbox_inches参数 ----------------------
+        # 保存图片，指定白色背景，确保边框完整保存
+        top_plot_path = os.path.join(self.output_dir, '随机森林重要特征图.tif')
+        plt.savefig(
+            top_plot_path, 
+            dpi=600, 
+            format='tif', 
+            facecolor='white',  # 保存时背景色为白色
+            edgecolor='black',  # 添加图片外边框
+            bbox_inches='tight' # 只保留一个bbox_inches参数
+        )
+        plt.close()
+        print(f"随机森林重要特征图已保存至: {top_plot_path}")
+    
+    # ---------------------- 相关性分析（无修改） ----------------------
+    def correlation_analysis(self):
+        """对随机森林筛选的特征进行相关性分析，删除相关性>0.8的低重要性特征"""
+        print("正在进行特征相关性分析与冗余删除...")
+        # 如果特征数量<=1，跳过相关性分析
+        if len(self.top10_features) <= 1:
+            print(f"特征数量仅为 {len(self.top10_features)}，无需进行相关性分析")
+            self.correlation_matrix = None
+            self.deleted_features = []
+            delete_df = pd.DataFrame({'提示': ['特征数量不足，未删除任何特征']})
+            delete_path = os.path.join(self.output_dir, '被删除的冗余特征列表.xlsx')
+            delete_df.to_excel(delete_path, index=False)
+            print(f"被删除的冗余特征列表已保存至: {delete_path}")
+            print(f"相关性分析后，最终保留 {len(self.top10_features)} 个特征")
+            return self
+        
+        # 1. 获取筛选特征的标准化数据
+        top_features_data = self.processed_data[self.top10_features].copy()
+        
+        # 2. 计算Pearson相关系数矩阵（保留4位小数，图表显示两位）
+        self.correlation_matrix = top_features_data.corr().round(4)
+        
+        # 3. 保存相关系数矩阵
+        corr_path = os.path.join(self.output_dir, '特征相关系数矩阵.xlsx')
+        self.correlation_matrix.to_excel(corr_path)
+        print(f"特征相关系数矩阵已保存至: {corr_path}")
+        
+        # 4. 找出相关性>0.8的特征对（仅看上三角矩阵，避免重复）
+        high_corr_pairs = []
+        # 获取上三角矩阵的索引（行<列，避免(i,j)与(j,i)重复）
+        for i in range(len(self.correlation_matrix.columns)):
+            for j in range(i + 1, len(self.correlation_matrix.columns)):
+                corr_value = self.correlation_matrix.iloc[i, j]
+                if abs(corr_value) > 0.8:  # 绝对值>0.8视为高相关
+                    feat1 = self.correlation_matrix.columns[i]
+                    feat2 = self.correlation_matrix.columns[j]
+                    high_corr_pairs.append({
+                        '特征1': feat1,
+                        '特征2': feat2,
+                        '相关系数': round(corr_value, 2)  # 保留两位小数
+                    })
+        
+        # 5. 处理高相关特征对：删除重要性更低的特征
+        self.deleted_features = []
+        if high_corr_pairs:
+            # 构建特征-重要性字典，方便快速查询
+            feat_importance = dict(zip(self.average_importance['特征'], self.average_importance['重要性']))
+            
+            for pair in high_corr_pairs:
+                feat1 = pair['特征1']
+                feat2 = pair['特征2']
+                # 跳过已被标记删除的特征
+                if feat1 in self.deleted_features or feat2 in self.deleted_features:
+                    continue
+                
+                # 比较重要性，删除得分低的
+                if feat_importance[feat1] > feat_importance[feat2]:
+                    delete_feat = feat2
+                else:
+                    delete_feat = feat1
+                
+                self.deleted_features.append(delete_feat)
+                # 从特征列表中移除
+                self.top10_features.remove(delete_feat)
+                print(f"高相关特征对（{feat1}-{feat2}，相关系数：{pair['相关系数']}）：删除{delete_feat}（重要性更低）")
+        else:
+            print("未发现相关性>0.8的特征对，无需删除冗余特征")
+        
+        # 6. 保存被删除的特征列表
+        delete_df = pd.DataFrame({
+            '被删除的冗余特征': self.deleted_features,
+            '删除原因': ['与其他特征相关性>0.8且重要性更低'] * len(self.deleted_features)
+        }) if self.deleted_features else pd.DataFrame({'提示': ['无冗余特征删除']})
+        delete_path = os.path.join(self.output_dir, '被删除的冗余特征列表.xlsx')
+        delete_df.to_excel(delete_path, index=False)
+        print(f"被删除的冗余特征列表已保存至: {delete_path}")
+        
+        # 7. 绘制重构的相关性热力图
+        self._plot_correlation_heatmap()
+        
+        # 8. 打印最终保留的特征数量
+        print(f"相关性分析后，最终保留 {len(self.top10_features)} 个特征")
+        return self
+    
+    def _plot_correlation_heatmap(self):
+        """重构热力图：修复Ellipse导入 + 下三角椭圆+分级显著标记 + 移除对角线名称"""
+        # 如果没有相关矩阵或特征数<=1，跳过绘图
+        if self.correlation_matrix is None or len(self.correlation_matrix.columns) <= 1:
+            print("特征数量不足，跳过相关性热力图绘制")
+            return
+        
+        plt.figure(figsize=(12, 10))
+        
+        # 设置背景色为白色
+        plt.gca().set_facecolor('white')
+        plt.gcf().patch.set_facecolor('white')
+        
+        # 复制相关系数矩阵用于处理
+        corr_mat = self.correlation_matrix.copy()
+        
+        # 1. 定义显著性标记（p值<0.05为*，<0.01为**）
+        from scipy.stats import pearsonr
+        p_matrix = np.zeros_like(corr_mat.values)
+        for i in range(len(corr_mat.columns)):
+            for j in range(len(corr_mat.columns)):
+                if i != j:
+                    corr, p = pearsonr(self.processed_data[corr_mat.columns[i]], 
+                                      self.processed_data[corr_mat.columns[j]])
+                    p_matrix[i, j] = p
+        
+        # 2. 创建上下三角掩码
+        mask_upper = np.triu(np.ones_like(corr_mat, dtype=bool), k=1)  # 上三角（不含对角线）
+        mask_lower = np.tril(np.ones_like(corr_mat, dtype=bool), k=-1)  # 下三角（不含对角线）
+        
+        # 3. 修复语法错误：合并mask参数，只传递一次
+        # 绘制下三角：椭圆 + 分级显著标记
+        sns.heatmap(corr_mat, 
+                   mask=mask_upper,  # 只显示下三角（包括对角线）
+                   cmap='RdBu_r',
+                   center=0,
+                   square=True,
+                   linewidths=.5,
+                   cbar=False,  # 先不显示颜色条
+                   annot=False,
+                   fmt='.2f')
+        
+        # 手动绘制下三角椭圆和分级显著标记
+        ax = plt.gca()
+        for i in range(len(corr_mat.columns)):
+            for j in range(len(corr_mat.columns)):
+                if i > j:  # 下三角
+                    corr_val = corr_mat.iloc[i, j]
+                    p_val = p_matrix[i, j]
+                    
+                    # 计算位置
+                    x = j + 0.5
+                    y = i + 0.5
+                    
+                    # 绘制椭圆（大小和颜色表示相关系数）
+                    ellipse_size = abs(corr_val) * 0.8  # 椭圆大小
+                    color = 'red' if corr_val > 0 else 'blue'
+                    
+                    # 根据p值设置透明度和显著标记
+                    if p_val < 0.01:
+                        alpha = 0.9
+                        sig_mark = '**'
+                    elif p_val < 0.05:
+                        alpha = 0.7
+                        sig_mark = '*'
+                    else:
+                        alpha = 0.4
+                        sig_mark = ''
+                    
+                    # 关键修复：使用正确导入的Ellipse类
+                    ellipse = Ellipse((x, y), ellipse_size, ellipse_size*0.6, 
+                                     facecolor=color, alpha=alpha, edgecolor='black', linewidth=1)
+                    ax.add_patch(ellipse)
+                    
+                    # 添加分级显著标记
+                    if sig_mark:
+                        plt.text(x, y, sig_mark, ha='center', va='center', 
+                                fontsize=16, fontweight='bold', color='white')
+        
+        # 4. 绘制上三角：数值（保留两位小数）
+        sns.heatmap(corr_mat,
+                   mask=~mask_upper,  # 只显示上三角
+                   cmap='RdBu_r',
+                   center=0,
+                   square=True,
+                   linewidths=.5,
+                   cbar=True,
+                   cbar_kws={'shrink': .8, 'label': 'Correlation Coefficient'},
+                   annot=True,
+                   fmt='.2f',
+                   annot_kws={'size': 16})  # 字号从17减小为16
+        
+        plt.title('Correlation Heatmap of Selected Features (Lower: Ellipse, Upper: Value)', 
+                  fontsize=20, fontweight='bold')
+        
+        # 坐标轴设置：字号从19减小为18
+        plt.xticks(fontsize=18)
+        plt.yticks(fontsize=18)
+        
+        # 颜色条设置
+        cbar = plt.gcf().axes[-1]
+        cbar.set_ylabel('Correlation Coefficient', fontsize=18, fontweight='bold')
+        cbar.tick_params(labelsize=16, width=2)
+        for label in cbar.get_yticklabels():
+            label.set_weight('bold')
+        
+        plt.tight_layout(pad=1.5)
+        heatmap_path = os.path.join(self.output_dir, '特征相关性热力图.tif')
+        plt.savefig(heatmap_path, dpi=600, format='tif', bbox_inches='tight', facecolor='white', edgecolor='none')
+        plt.close()
+        print(f"特征相关性热力图已保存至: {heatmap_path}")
+    
+    # ---------------------- 保存最终结果（无修改） ----------------------
+    def save_final_results(self):
+        # 使用相关性分析后保留的特征
+        final_data = pd.concat([
+            self.sample_labels.reset_index(drop=True),
+            self.flavor_types.reset_index(drop=True),
+            self.processed_data[self.top10_features].reset_index(drop=True)
+        ], axis=1)
+        
+        final_data.columns = [self.data.columns[0], self.data.columns[1]] + self.top10_features
+        
+        final_path = os.path.join(self.output_dir, '筛选后的特征数据.xlsx')
+        final_data.to_excel(final_path, index=False)
+        print(f"筛选后的特征数据已保存至: {final_path}")
+        
+        # 保存最终保留的特征列表（标注是否经过冗余删除）
+        features_list = pd.DataFrame({
+            '最终保留的特征': self.top10_features,
+            '备注': ['随机森林筛选且无高相关冗余'] * len(self.top10_features)
+        })
+        features_path = os.path.join(self.output_dir, '最终保留的特征列表.xlsx')
+        features_list.to_excel(features_path, index=False)
+        print(f"最终保留的特征列表已保存至: {features_path}")
+        
+        return self
+
+if __name__ == "__main__":
+    file_path = ""  # 直接指定路径，无需输入
+    
+    if not os.path.exists(file_path):
+        print(f"错误: 文件 '{file_path}' 不存在!")
+    else:
+        # 流程调整：删除PCA步骤
+        selector = TobaccoFeatureSelector(file_path)
+        (selector.load_data()
+                .handle_outliers()
+                .standardize_data()
+                .separation_analysis()
+                .random_forest_selection()
+                .correlation_analysis()
+                .save_final_results())
+        
+        print("特征筛选流程已完成!")
